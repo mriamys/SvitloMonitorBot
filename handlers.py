@@ -1729,8 +1729,10 @@ async def support_tickets_menu(message: types.Message):
 
 @router.callback_query(F.data.startswith("tickets|"))
 async def show_tickets_list(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id != ADMIN_ID and (not isinstance(ADMIN_IDS, list) or callback.from_user.id not in ADMIN_IDS):
+        await callback.answer("У вас немає доступу.", show_alert=True)
         return
+    await callback.answer()
 
     ticket_type = callback.data.split("|")[1]
 
@@ -1742,8 +1744,10 @@ async def show_tickets_list(callback: types.CallbackQuery):
         title = "📋 Всі звернення"
 
     if not tickets:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="◀️ Назад", callback_data="tickets|all" if ticket_type == "unread" else "tickets|unread")
         await callback.message.edit_text(
-            f"{title}\n\n✅ Немає звернень", parse_mode="Markdown"
+            f"{title}\n\n✅ Немає звернень", reply_markup=kb.as_markup(), parse_mode="Markdown"
         )
         return
 
@@ -1770,8 +1774,10 @@ async def show_tickets_list(callback: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("viewticket|"))
 async def view_ticket(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
+    if callback.from_user.id != ADMIN_ID and (not isinstance(ADMIN_IDS, list) or callback.from_user.id not in ADMIN_IDS):
+        await callback.answer("У вас немає доступу.", show_alert=True)
         return
+    await callback.answer()
 
     ticket_id = int(callback.data.split("|")[1])
 
@@ -1782,16 +1788,24 @@ async def view_ticket(callback: types.CallbackQuery):
 
     user_id, username, status = ticket_info
 
+    # Позначаємо як прочитаний
+    if status == "unread":
+        await db.mark_ticket_read(ticket_id)
+        status = "read"
+
+    safe_username = (username or 'Unknown').replace('_', '\\_').replace('*', '\\*').replace('`', '')
+
     messages = await db.get_ticket_messages(ticket_id)
 
     text = f"💬 **Звернення #{ticket_id}**\n"
-    text += f"👤 @{username or 'Unknown'} (ID: {user_id})\n"
+    text += f"👤 @{safe_username} (ID: {user_id})\n"
     text += f"📊 Статус: {status}\n"
     text += "─────────────────\n\n"
 
     for from_user, msg_text, created_at in messages:
         icon = "👤" if from_user == "user" else "👨‍💼"
-        display_text = msg_text[:200] + "..." if len(msg_text) > 200 else msg_text
+        safe_msg = msg_text.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`')
+        display_text = safe_msg[:200] + "..." if len(safe_msg) > 200 else safe_msg
         text += f"{icon} **{from_user}**: {display_text}\n⏰ {created_at}\n\n"
 
     kb = InlineKeyboardBuilder()
@@ -1801,12 +1815,17 @@ async def view_ticket(callback: types.CallbackQuery):
     else:
         kb.button(text="🔓 Відкрити знову", callback_data=f"reopen|{ticket_id}")
     kb.button(text="🗑 Видалити", callback_data=f"delticket|{ticket_id}")
-    kb.button(text="◀️ Назад", callback_data="tickets|unread")
+    kb.button(text="◀️ Назад", callback_data="tickets|all")
     kb.adjust(2, 2, 1)
 
-    await callback.message.edit_text(
-        text, reply_markup=kb.as_markup(), parse_mode="Markdown"
-    )
+    try:
+        await callback.message.edit_text(
+            text, reply_markup=kb.as_markup(), parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"[view_ticket markdown error]: {e}")
+        clean_text = text.replace("**", "").replace("__", "").replace("`", "").replace("\\_", "_").replace("\\*", "*")
+        await callback.message.edit_text(clean_text, reply_markup=kb.as_markup())
 
 
 @router.callback_query(F.data.startswith("reply|"))
