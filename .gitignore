@@ -1,2 +1,6 @@
 .env
 *db
+__pycache__/
+*.pyc
+api_cache.json
+test_*.py

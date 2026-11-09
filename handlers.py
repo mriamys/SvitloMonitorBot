@@ -1800,6 +1800,7 @@ async def view_ticket(callback: types.CallbackQuery):
         kb.button(text="🔒 Закрити", callback_data=f"close|{ticket_id}")
     else:
         kb.button(text="🔓 Відкрити знову", callback_data=f"reopen|{ticket_id}")
+    kb.button(text="🗑 Видалити", callback_data=f"delticket|{ticket_id}")
     kb.button(text="◀️ Назад", callback_data="tickets|unread")
     kb.adjust(2, 2, 1)
 
@@ -1819,6 +1820,17 @@ async def admin_reply_click(callback: types.CallbackQuery):
         f"✍️ **Введіть відповідь для тікету #{ticket_id}:**", parse_mode="Markdown"
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delticket|"))
+async def delticket_handler(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    ticket_id = int(callback.data.split("|")[1])
+    await db.delete_ticket(ticket_id)
+    await callback.answer("✅ Тікет видалено!", show_alert=True)
+    callback.data = "tickets|all"
+    await show_tickets_list(callback)
 
 
 @router.callback_query(F.data.startswith("close|"))

@@ -1,0 +1,18 @@
+services:
+  svitlo-bot:
+    build: .
+    container_name: svitlo-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - .:/app
+    deploy:
+      resources:
+        reservations:
+          memory: 40M
+    networks:
+      - bots-net
+
+networks:
+  bots-net:
+    external: true

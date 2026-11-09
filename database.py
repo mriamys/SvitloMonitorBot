@@ -1,197 +1,137 @@
-# database.py
-import aiosqlite
+# database.py - MySQL backend for SvitloMonitorBot
+import os
+import re
+import aiomysql
 from datetime import datetime, timedelta
-from config import DB_NAME
+
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_USER = os.getenv("DB_USER", "svitlo")
+DB_PASS = os.getenv("DB_PASS", "svitlo_secure_pass_2026")
+DB_NAME = os.getenv("DB_NAME", "svitlo_bot")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+
+_pool = None
+
+async def get_pool():
+    global _pool
+    if _pool is None:
+        _pool = await aiomysql.create_pool(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASS,
+            db=DB_NAME,
+            charset='utf8mb4',
+            autocommit=False,
+            minsize=2,
+            maxsize=20
+        )
+    return _pool
+
+class MySQLCompatCursor:
+    def __init__(self, cur):
+        self.cur = cur
+
+    async def fetchone(self):
+        return await self.cur.fetchone()
+
+    async def fetchall(self):
+        return await self.cur.fetchall()
+
+    @property
+    def rowcount(self):
+        return self.cur.rowcount
+
+    @property
+    def lastrowid(self):
+        return self.cur.lastrowid
+
+class MySQLCompatConnection:
+    def __init__(self, pool):
+        self.pool = pool
+        self.conn = None
+
+    async def __aenter__(self):
+        self.conn = await self.pool.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            self.pool.release(self.conn)
+
+    def execute(self, query, params=None):
+        return MySQLCursorContext(self.conn, query, params)
+
+    async def commit(self):
+        if self.conn:
+            await self.conn.commit()
+
+class MySQLCursorContext:
+    def __init__(self, conn, query, params):
+        self.conn = conn
+        q = query
+        q = re.sub(r'ON\s+CONFLICT\s*\([^)]*\)\s*DO\s+UPDATE\s+SET', 'ON DUPLICATE KEY UPDATE', q, flags=re.IGNORECASE)
+        q = re.sub(r'excluded\.(\w+)', r'VALUES(\1)', q, flags=re.IGNORECASE)
+        q = re.sub(r'INSERT\s+OR\s+IGNORE', 'INSERT IGNORE', q, flags=re.IGNORECASE)
+        q = re.sub(r'(?<![`\w])key(?!\s*=\s*VALUES)(?![`\w])', '`key`', q, flags=re.IGNORECASE)
+        q = re.sub(r'ON\s+DUPLICATE\s+`key`\s+UPDATE', 'ON DUPLICATE KEY UPDATE', q, flags=re.IGNORECASE)
+        q = re.sub(r'(?<![`\w])date(?![`\w])', '`date`', q, flags=re.IGNORECASE)
+        q = q.replace('?', '%s')
+        self.query = q
+        self.params = params
+        self.cur = None
+
+    async def _execute(self):
+        self.cur = await self.conn.cursor()
+        try:
+            await self.cur.execute(self.query, self.params)
+        except Exception as e:
+            if "Duplicate column name" in str(e) or "already exists" in str(e):
+                pass
+            else:
+                print(f"[SQL Error]: {e} on query: {self.query}")
+                raise e
+        return MySQLCompatCursor(self.cur)
+
+    def __await__(self):
+        return self._execute().__await__()
+
+    async def __aenter__(self):
+        return await self._execute()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.cur:
+            await self.cur.close()
+
+class DBConnectContext:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        p = await get_pool()
+        self.compat = MySQLCompatConnection(p)
+        return await self.compat.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.compat.__aexit__(exc_type, exc_val, exc_tb)
+
+def connect_db(*args, **kwargs):
+    return DBConnectContext(*args, **kwargs)
+
+# database.py
+
+from datetime import datetime, timedelta
+
 
 
 async def init_db():
-    """Створює таблиці та безпечно оновлює структуру."""
-    async with aiosqlite.connect(DB_NAME) as db:
-        # === 1. ОСНОВНІ ДАНІ (НЕ ЧІПАЄМО) ===
-        # Таблиця для користувачів
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                region TEXT,
-                queue TEXT,
-                mode TEXT DEFAULT 'normal'
-            )
-        """)
-
-        # === МІГРАЦІЯ: ДОДАВАННЯ НАЛАШТУВАНЬ (Personalization 2.0) ===
-        # Додаємо нові колонки до існуючої таблиці users.
-
-        try:
-            # Час попередження про ВІДКЛЮЧЕННЯ (стандарт 5 хв)
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN notify_before INTEGER DEFAULT 5"
-            )
-        except:
-            pass
-
-        try:
-            # === НОВЕ: Час попередження про ВКЛЮЧЕННЯ (стандарт 0 - ВИМКНЕНО) ===
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN notify_return_before INTEGER DEFAULT 0"
-            )
-        except:
-            pass
-
-        # === ФІКС ДЛЯ НОВОГО ТАЙМЕРА ===
-        # Якщо ми помилково встановили 5 хвилин у попередній версії коду (до релізу меню),
-        # цей рядок примусово вимкне таймер включення для всіх, щоб не спамити.
-        try:
-            # Перевіряємо, чи є користувачі, у яких стоїть 5 (помилковий дефолт)
-            # ВАЖЛИВО: Це спрацює тільки якщо ми запускаємо це ДО того, як люди почали користуватись меню.
-            await db.execute(
-                "UPDATE users SET notify_return_before = 0 WHERE notify_return_before = 5"
-            )
-            await db.commit()
-        except:
-            pass
-
-        try:
-            # Сповіщення про відключення (1 = вкл, 0 = викл)
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN notify_outage INTEGER DEFAULT 1"
-            )
-        except:
-            pass
-
-        try:
-            # Сповіщення про включення (рівно в момент події)
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN notify_return INTEGER DEFAULT 1"
-            )
-        except:
-            pass
-
-        try:
-            # Сповіщення про зміни графіку
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN notify_changes INTEGER DEFAULT 1"
-            )
-        except:
-            pass
-
-        try:
-            # Режим відображення ('blackout' - відключення, 'light' - світло)
-            await db.execute(
-                "ALTER TABLE users ADD COLUMN display_mode TEXT DEFAULT 'blackout'"
-            )
-        except:
-            pass
-
-        try:
-            # Активність (чи не заблокував користувач бота)
-            await db.execute("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1")
-        except:
-            pass
-
-        # Таблиця для статистики
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS daily_stats (
-                date TEXT,
-                region TEXT,
-                queue TEXT,
-                off_hours REAL,
-                PRIMARY KEY (date, region, queue)
-            )
-        """)
-
-        # === НОВЕ: СИСТЕМНІ НАЛАШТУВАННЯ ===
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS system_config (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        # Дефолт: Сайт увімкнено (1)
-        await db.execute(
-            "INSERT OR IGNORE INTO system_config (key, value) VALUES ('hoe_site_enabled', '1')"
-        )
-
-        # === 2. ПЕРЕВІРКА І ВИПРАВЛЕННЯ ТІЛЬКИ ТАБЛИЦЬ ПІДТРИМКИ ===
-        # Перевіряємо, чи існує таблиця support_messages і чи є в ній колонка ticket_id
-        try:
-            async with db.execute("PRAGMA table_info(support_messages)") as cur:
-                columns = [row[1] for row in await cur.fetchall()]
-                # Якщо таблиця є, але в ній немає потрібної колонки 'ticket_id'
-                if columns and "ticket_id" not in columns:
-                    print(
-                        "⚠️ Оновлення структури таблиць підтримки... (Основні дані збережено)"
-                    )
-                    # Видаляємо тільки старі таблиці підтримки, бо вони не сумісні з новим кодом
-                    await db.execute("DROP TABLE IF EXISTS support_messages")
-                    await db.execute("DROP TABLE IF EXISTS support_tickets")
-                    await db.commit()
-        except Exception as e:
-            print(f"Non-critical DB check error: {e}")
-
-        # === 3. СТВОРЕННЯ ТАБЛИЦЬ ПІДТРИМКИ (ЯКЩО ЇХ НЕМАЄ) ===
-
-        # Таблиця тікетів
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS support_tickets (
-                ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                status TEXT DEFAULT 'unread',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                last_message_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
-            )
-        """)
-
-        # Таблиця повідомлень
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS support_messages (
-                message_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticket_id INTEGER NOT NULL,
-                from_user TEXT NOT NULL,
-                message_text TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (ticket_id) REFERENCES support_tickets(ticket_id)
-            )
-        """)
-
-        # === НОВЕ: ТАБЛИЦЯ ПІДПИСОК ГРУП І КАНАЛІВ ===
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS group_subscriptions (
-                chat_id INTEGER PRIMARY KEY,
-                chat_title TEXT,
-                chat_type TEXT,
-                region TEXT NOT NULL,
-                queue TEXT NOT NULL,
-                display_mode TEXT DEFAULT 'blackout',
-                notify_outage INTEGER DEFAULT 1,
-                notify_return INTEGER DEFAULT 1,
-                notify_changes INTEGER DEFAULT 1,
-                notify_before INTEGER DEFAULT 5,
-                notify_return_before INTEGER DEFAULT 0,
-                notify_morning INTEGER DEFAULT 1,
-                added_by INTEGER,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Міграція для додавання нових колонок, якщо їх немає
-        try:
-            await db.execute(
-                "ALTER TABLE group_subscriptions ADD COLUMN notify_before INTEGER DEFAULT 5"
-            )
-            await db.execute(
-                "ALTER TABLE group_subscriptions ADD COLUMN notify_return_before INTEGER DEFAULT 0"
-            )
-        except Exception:
-            pass
-
-        await db.commit()
+    """Таблиці створені в MySQL."""
+    return
 
 
 async def save_user(user_id, region, queue):
     """Зберігає або оновлює вибір користувача."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             """
             INSERT INTO users (user_id, region, queue) 
@@ -205,7 +145,7 @@ async def save_user(user_id, region, queue):
 
 async def get_user(user_id):
     """Повертає регіон і чергу користувача."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT region, queue FROM users WHERE user_id = ?", (user_id,)
         ) as cur:
@@ -217,7 +157,7 @@ async def get_user(user_id):
 
 async def get_user_settings(user_id):
     """Отримує всі налаштування користувача."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         # Якщо користувача немає або поля пусті, повертаємо дефолтні налаштування
         defaults = {
             "notify_before": 5,
@@ -272,7 +212,7 @@ async def update_user_setting(user_id, key, value):
     if key not in allowed_keys:
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             f"UPDATE users SET {key} = ? WHERE user_id = ?", (value, user_id)
         )
@@ -284,7 +224,7 @@ async def update_user_setting(user_id, key, value):
 
 async def save_stats(region, queue, date_str, off_hours):
     """Записує статистику за день."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             """
             INSERT INTO daily_stats (date, region, queue, off_hours) 
@@ -298,7 +238,7 @@ async def save_stats(region, queue, date_str, off_hours):
 
 async def get_stats_data(region, queue):
     """Отримує статистику за останні 7 днів (від сьогодні і назад)."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         sql = """
             SELECT date, off_hours 
             FROM daily_stats 
@@ -313,14 +253,14 @@ async def get_stats_data(region, queue):
 
 async def get_all_subs():
     """Отримує список всіх унікальних підписок (регіон + черга)."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute("SELECT DISTINCT region, queue FROM users") as cur:
             return await cur.fetchall()
 
 
 async def get_users_by_queue(region, queue):
     """Отримує ID всіх користувачів конкретної черги."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT user_id FROM users WHERE region = ? AND queue = ?", (region, queue)
         ) as cur:
@@ -329,21 +269,21 @@ async def get_users_by_queue(region, queue):
 
 async def delete_user(user_id):
     """Видаляє користувача з бази даних (відписка)."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         await db.commit()
 
 
 async def set_user_mode(user_id, mode):
     """Встановлює режим користувача (normal, support, admin)."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute("UPDATE users SET mode = ? WHERE user_id = ?", (mode, user_id))
         await db.commit()
 
 
 async def get_user_mode(user_id):
     """Отримує режим користувача."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT mode FROM users WHERE user_id = ?", (user_id,)
         ) as cur:
@@ -353,7 +293,7 @@ async def get_user_mode(user_id):
 
 async def get_users_count():
     """Отримує кількість всіх користувачів."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute("SELECT COUNT(*) FROM users") as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
@@ -361,7 +301,7 @@ async def get_users_count():
 
 async def get_active_users_count():
     """Отримує кількість активних користувачів."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         # Враховуємо і 1, і NULL (на випадок якщо ALTER TABLE не застосував дефолт)
         async with db.execute(
             "SELECT COUNT(*) FROM users WHERE is_active = 1 OR is_active IS NULL"
@@ -372,28 +312,28 @@ async def get_active_users_count():
 
 async def mark_user_active(user_id):
     """Позначає користувача активним."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute("UPDATE users SET is_active = 1 WHERE user_id = ?", (user_id,))
         await db.commit()
 
 
 async def mark_user_inactive(user_id):
     """Позначає користувача неактивним (заблокував бота)."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute("UPDATE users SET is_active = 0 WHERE user_id = ?", (user_id,))
         await db.commit()
 
 
 async def get_all_users_for_broadcast():
     """Отримує всіх користувачів для розсилки."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute("SELECT DISTINCT user_id FROM users") as cur:
             return await cur.fetchall()
 
 
 async def cleanup_old_stats():
     """Видаляє статистику старше 7 днів."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         cutoff_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         await db.execute("DELETE FROM daily_stats WHERE date < ?", (cutoff_date,))
         await db.commit()
@@ -401,7 +341,7 @@ async def cleanup_old_stats():
 
 async def get_off_hours_for_date(region, queue, date_str):
     """Отримує години відключення для конкретної дати."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT off_hours FROM daily_stats WHERE region = ? AND queue = ? AND date = ?",
             (region, queue, date_str),
@@ -415,7 +355,7 @@ async def get_off_hours_for_date(region, queue, date_str):
 
 async def set_system_config(key, value):
     """Зберігає системне налаштування."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             "INSERT INTO system_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, str(value)),
@@ -425,7 +365,7 @@ async def set_system_config(key, value):
 
 async def get_system_config(key, default=None):
     """Отримує системне налаштування."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT value FROM system_config WHERE key = ?", (key,)
         ) as cur:
@@ -438,7 +378,7 @@ async def get_system_config(key, default=None):
 
 async def create_or_get_ticket(user_id, username):
     """Створює новий тікет або повертає існуючий відкритий тікет."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         # Перевіряємо чи є відкритий тікет
         async with db.execute(
             "SELECT ticket_id FROM support_tickets WHERE user_id = ? AND status != 'closed' ORDER BY last_message_at DESC LIMIT 1",
@@ -459,7 +399,7 @@ async def create_or_get_ticket(user_id, username):
 
 async def save_support_message(ticket_id, from_user, message_text):
     """Зберігає повідомлення в тікет."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             "INSERT INTO support_messages (ticket_id, from_user, message_text) VALUES (?, ?, ?)",
             (ticket_id, from_user, message_text),
@@ -474,7 +414,7 @@ async def save_support_message(ticket_id, from_user, message_text):
 
 async def get_unread_tickets():
     """Отримує всі непрочитані тікети."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute("""
             SELECT t.ticket_id, t.user_id, t.username, t.created_at, t.last_message_at,
                    (SELECT COUNT(*) FROM support_messages WHERE ticket_id = t.ticket_id) as msg_count
@@ -487,7 +427,7 @@ async def get_unread_tickets():
 
 async def get_all_tickets():
     """Отримує всі тікети."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute("""
             SELECT t.ticket_id, t.user_id, t.username, t.status, t.created_at, t.last_message_at,
                    (SELECT COUNT(*) FROM support_messages WHERE ticket_id = t.ticket_id) as msg_count
@@ -500,7 +440,7 @@ async def get_all_tickets():
 
 async def get_ticket_messages(ticket_id):
     """Отримує всі повідомлення тікету."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             """
             SELECT from_user, message_text, created_at
@@ -515,7 +455,7 @@ async def get_ticket_messages(ticket_id):
 
 async def mark_ticket_read(ticket_id):
     """Позначає тікет як прочитаний."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             "UPDATE support_tickets SET status = 'read' WHERE ticket_id = ?",
             (ticket_id,),
@@ -525,7 +465,7 @@ async def mark_ticket_read(ticket_id):
 
 async def close_ticket(ticket_id):
     """Закриває тікет."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             "UPDATE support_tickets SET status = 'closed' WHERE ticket_id = ?",
             (ticket_id,),
@@ -535,7 +475,7 @@ async def close_ticket(ticket_id):
 
 async def reopen_ticket(ticket_id):
     """Знову відкриває тікет."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             "UPDATE support_tickets SET status = 'unread', last_message_at = CURRENT_TIMESTAMP WHERE ticket_id = ?",
             (ticket_id,),
@@ -545,7 +485,7 @@ async def reopen_ticket(ticket_id):
 
 async def get_ticket_info(ticket_id):
     """Отримує інформацію про тікет."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT user_id, username, status FROM support_tickets WHERE ticket_id = ?",
             (ticket_id,),
@@ -555,7 +495,7 @@ async def get_ticket_info(ticket_id):
 
 async def get_unread_count():
     """Отримує кількість непрочитаних тікетів."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT COUNT(*) FROM support_tickets WHERE status = 'unread'"
         ) as cur:
@@ -568,7 +508,7 @@ async def get_unread_count():
 
 async def save_group_sub(chat_id, chat_title, chat_type, region, queue, added_by):
     """Зберігає або оновлює підписку групи/каналу."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             """
             INSERT INTO group_subscriptions (chat_id, chat_title, chat_type, region, queue, added_by)
@@ -586,7 +526,7 @@ async def save_group_sub(chat_id, chat_title, chat_type, region, queue, added_by
 
 async def get_group_sub(chat_id):
     """Повертає підписку групи/каналу."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT region, queue, display_mode, notify_outage, notify_return, notify_changes, notify_morning FROM group_subscriptions WHERE chat_id = ?",
             (chat_id,),
@@ -596,7 +536,7 @@ async def get_group_sub(chat_id):
 
 async def delete_group_sub(chat_id):
     """Видаляє підписку групи/каналу."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             "DELETE FROM group_subscriptions WHERE chat_id = ?", (chat_id,)
         )
@@ -605,7 +545,7 @@ async def delete_group_sub(chat_id):
 
 async def get_all_group_subs():
     """Отримує список усіх підписок груп/каналів."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT chat_id, chat_title, chat_type, region, queue FROM group_subscriptions"
         ) as cur:
@@ -614,7 +554,7 @@ async def get_all_group_subs():
 
 async def get_user_managed_groups(user_id):
     """Отримує всі групи/канали, додані цим користувачем."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             "SELECT chat_id, chat_title, chat_type, region, queue FROM group_subscriptions WHERE added_by = ?",
             (user_id,),
@@ -624,7 +564,7 @@ async def get_user_managed_groups(user_id):
 
 async def get_groups_by_queue(region, queue):
     """Отримує групи/канали з конкретною чергою (для розсилки)."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute(
             """
             SELECT chat_id, display_mode, notify_outage, notify_return, notify_changes, notify_morning, notify_before, notify_return_before 
@@ -649,7 +589,7 @@ async def update_group_setting(chat_id, key, value):
     ]
     if key not in allowed_keys:
         return
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         await db.execute(
             f"UPDATE group_subscriptions SET {key} = ? WHERE chat_id = ?",
             (value, chat_id),
@@ -668,7 +608,7 @@ async def get_group_settings(chat_id):
         "notify_before": 5,
         "notify_return_before": 0,
     }
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         try:
             async with db.execute(
                 """
@@ -699,7 +639,15 @@ async def get_group_settings(chat_id):
 
 async def get_groups_count():
     """Отримує кількість підключених груп/каналів."""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with connect_db() as db:
         async with db.execute("SELECT COUNT(*) FROM group_subscriptions") as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
+
+
+async def delete_ticket(ticket_id):
+    """Повністю видаляє тікет та його повідомлення."""
+    async with connect_db() as db:
+        await db.execute("DELETE FROM support_messages WHERE ticket_id = ?", (ticket_id,))
+        await db.execute("DELETE FROM support_tickets WHERE ticket_id = ?", (ticket_id,))
+        await db.commit()
