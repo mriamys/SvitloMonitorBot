@@ -4,6 +4,8 @@ services:
     container_name: svitlo-bot
     restart: unless-stopped
     env_file: .env
+    environment:
+      - TZ=Europe/Kyiv
     volumes:
       - .:/app
     deploy:
