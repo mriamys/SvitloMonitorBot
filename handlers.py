@@ -23,6 +23,30 @@ ADMIN_ID = ADMIN_IDS[0] if isinstance(ADMIN_IDS, list) and ADMIN_IDS else 723550
 
 router = Router()
 
+
+# --- Глобальні запобіжники для кнопок ---
+@router.callback_query.middleware()
+async def _auto_answer_callback(handler, event, data):
+    """Гарантує відповідь на callback (прибирає «годинник» на кнопці)."""
+    try:
+        return await handler(event, data)
+    finally:
+        try:
+            await event.answer()
+        except Exception:
+            pass
+
+
+@router.errors()
+async def _errors_handler(event: types.ErrorEvent):
+    """Ігноруємо безпечні помилки Telegram, решту логуємо."""
+    if isinstance(event.exception, TelegramBadRequest) and (
+        "message is not modified" in str(event.exception)
+    ):
+        return True
+    print(f"[Handler Error]: {event.exception!r}")
+    return True
+
 # Витягуємо username бота з токену для посилання "Додати в групу"
 _bot_username_cache = None
 
@@ -657,7 +681,7 @@ async def show_group_minutes_menu(message, chat_id, timer_type):
     text = f"{title}\n\n" f"За скільки хвилин попередити учасників?"
 
     kb = InlineKeyboardBuilder()
-    times = [5, 15, 30, 60]
+    times = [5, 10, 15, 30, 60]
 
     for t in times:
         mark = "✅" if current == t else ""
@@ -675,7 +699,7 @@ async def show_group_minutes_menu(message, chat_id, timer_type):
         )
     )
 
-    kb.adjust(2, 2, 1)
+    kb.adjust(3, 2, 1)
     kb.row(
         InlineKeyboardButton(
             text="🔙 Назад", callback_data=f"grp_menu_time_select|{chat_id}"
@@ -933,7 +957,7 @@ async def show_minutes_menu(message: types.Message, user_id, timer_type):
     text = f"{title}\n\n" f"За скільки хвилин вас попередити?"
 
     kb = InlineKeyboardBuilder()
-    times = [5, 15, 30, 60]
+    times = [5, 10, 15, 30, 60]
 
     for t in times:
         mark = "✅" if current == t else ""
@@ -950,7 +974,7 @@ async def show_minutes_menu(message: types.Message, user_id, timer_type):
         )
     )
 
-    kb.adjust(2, 2, 1)
+    kb.adjust(3, 2, 1)
     kb.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu_time_select"))
 
     await message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="Markdown")

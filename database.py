@@ -22,7 +22,10 @@ async def get_pool():
             password=DB_PASS,
             db=DB_NAME,
             charset='utf8mb4',
-            autocommit=False,
+            # autocommit=True обов'язково: інакше пул-з'єднання тримають старий
+            # snapshot (REPEATABLE READ) і бачать застарілі дані (режим підтримки,
+            # таймери тощо не оновлювалися).
+            autocommit=True,
             minsize=2,
             maxsize=20
         )

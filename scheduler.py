@@ -457,6 +457,7 @@ async def check_alerts(bot):
             # Часові точки для перевірки
             check_moments = {
                 5: (now + timedelta(minutes=5)).strftime("%H:%M"),
+                10: (now + timedelta(minutes=10)).strftime("%H:%M"),
                 15: (now + timedelta(minutes=15)).strftime("%H:%M"),
                 30: (now + timedelta(minutes=30)).strftime("%H:%M"),
                 60: (now + timedelta(minutes=60)).strftime("%H:%M"),
@@ -686,6 +687,10 @@ async def auto_backup(bot):
                 ADMIN_IDS[0] if isinstance(ADMIN_IDS, list) and ADMIN_IDS else ADMIN_IDS
             )
 
+            import os
+            if not DB_NAME or not os.path.isfile(DB_NAME):
+                await asyncio.sleep(60)
+                continue
             db_file = FSInputFile(DB_NAME)
             caption = f"📦 **Автоматичний бекап бази даних**\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
